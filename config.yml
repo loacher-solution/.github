@@ -7,8 +7,8 @@ dedicated_branch: ""
 recent_logs_count: 3
 default_agent: developer
 
-# Runner labels (configured in the reusable workflows)
+# Runner labels — all agents share the same pool of self-hosted runners
 runners:
   orchestrator: "self-hosted"
-  developer: "agentic-developer"
-  reviewer: "agentic-reviewer"
+  developer: "self-hosted"
+  reviewer: "self-hosted"
