@@ -139,22 +139,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          # Remove any existing review-cycle labels
+          # Only set review-cycle:0 if no review-cycle label exists yet.
+          # If one already exists (e.g. review-cycle:1 set by the reviewer),
+          # keep it — resetting to 0 would break the max-cycle check.
           EXISTING=$(gh issue view "${{ steps.issue.outputs.number }}" \
             --repo "${{ steps.issue.outputs.repo }}" \
             --json labels --jq '.labels[].name' | grep "^review-cycle:" || true)
-          for label in $EXISTING; do
+          if [ -z "$EXISTING" ]; then
+            gh label create "review-cycle:0" --repo "${{ steps.issue.outputs.repo }}" \
+              --color "0E8A16" --description "Review cycle counter" 2>/dev/null || true
             gh issue edit "${{ steps.issue.outputs.number }}" \
               --repo "${{ steps.issue.outputs.repo }}" \
-              --remove-label "$label" 2>/dev/null || true
-          done
-
-          # Add review-cycle:0 (create label if needed)
-          gh label create "review-cycle:0" --repo "${{ steps.issue.outputs.repo }}" \
-            --color "0E8A16" --description "Review cycle counter" 2>/dev/null || true
-          gh issue edit "${{ steps.issue.outputs.number }}" \
-            --repo "${{ steps.issue.outputs.repo }}" \
-            --add-label "review-cycle:0"
+              --add-label "review-cycle:0"
+          fi
 
       - name: Update project status to In Progress
         if: steps.trigger.outputs.source == 'project' && steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && steps.issue_from_project.outputs.status == 'Ready'
