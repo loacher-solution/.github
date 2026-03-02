@@ -1,0 +1,351 @@
+name: Reviewer Agent
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        description: "Issue number being reviewed"
+        type: string
+        required: true
+      pr_number:
+        description: "PR number to review"
+        type: string
+        required: true
+      review_cycle:
+        description: "Current review cycle"
+        type: string
+        required: true
+        default: "0"
+      max_review_cycles:
+        description: "Max review cycles before escalation"
+        type: string
+        required: false
+        default: "3"
+      project_node_id:
+        description: "Project node ID for status updates"
+        type: string
+        required: false
+        default: ""
+      item_node_id:
+        description: "Project item node ID for status updates"
+        type: string
+        required: false
+        default: ""
+      runner:
+        description: "Runner label for this workflow"
+        type: string
+        required: false
+        default: "self-hosted"
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "OAuth token for Claude Code CLI"
+        required: false
+      WORKFLOW_PAT:
+        description: "PAT for cross-repo dispatch and project updates"
+        required: false
+
+jobs:
+  review:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    concurrency:
+      group: review-issue-${{ inputs.issue_number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup prerequisites
+        run: |
+          NEED_APT=false
+          PACKAGES=""
+
+          # Node.js / npm (required to install Claude Code CLI)
+          if ! command -v npm &>/dev/null; then
+            NEED_APT=true
+            PACKAGES="nodejs npm"
+          fi
+
+          # jq
+          if ! command -v jq &>/dev/null; then
+            NEED_APT=true
+            PACKAGES="$PACKAGES jq"
+          fi
+
+          # python3
+          if ! command -v python3 &>/dev/null; then
+            NEED_APT=true
+            PACKAGES="$PACKAGES python3"
+          fi
+
+          if [ "$NEED_APT" = "true" ]; then
+            echo "::group::Installing missing packages:$PACKAGES"
+            sudo apt-get update -qq && sudo apt-get install -y $PACKAGES
+            echo "::endgroup::"
+          fi
+
+          # Claude Code CLI
+          if ! command -v claude &>/dev/null; then
+            echo "::group::Installing Claude Code CLI"
+            npm install -g @anthropic-ai/claude-code
+            echo "::endgroup::"
+          else
+            echo "claude already installed: $(claude --version 2>/dev/null || echo 'ok')"
+          fi
+
+      - name: Read repo config
+        id: config
+        run: |
+          if [ -f ".claude/config.yml" ]; then
+            YOLO_MODE=$(grep '^yolo_mode:' .claude/config.yml | sed 's/yolo_mode://' | tr -d ' "'"'" | head -1)
+            MAX_CYCLES=$(grep '^max_review_cycles:' .claude/config.yml | sed 's/max_review_cycles://' | tr -d ' "'"'" | head -1)
+          fi
+          echo "yolo_mode=${YOLO_MODE:-false}" >> "$GITHUB_OUTPUT"
+          echo "max_review_cycles=${MAX_CYCLES:-${{ inputs.max_review_cycles }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Post run link to issue
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" \
+            --body "**Reviewer Agent** started (cycle ${{ inputs.review_cycle }}).
+          [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      - name: Switch to PR head ref
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          PR_BRANCH=$(gh pr view "${{ inputs.pr_number }}" --json headRefName --jq '.headRefName')
+          git checkout "$PR_BRANCH"
+
+      - name: Gather review context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # Get issue details
+          ISSUE_JSON=$(gh issue view "${{ inputs.issue_number }}" --json title,body)
+          ISSUE_TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+          ISSUE_BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
+
+          # Get PR diff
+          PR_DIFF=$(gh pr diff "${{ inputs.pr_number }}")
+
+          # Save to files
+          echo "$ISSUE_BODY" > /tmp/issue_body.md
+          echo "$PR_DIFF" > /tmp/pr_diff.txt
+          echo "issue_title=$ISSUE_TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble task prompt
+        run: |
+          cat > /tmp/reviewer_prompt.md << TASK_EOF
+          ## Your Task
+
+          Review PR #${{ inputs.pr_number }} for Issue #${{ inputs.issue_number }}: ${{ steps.context.outputs.issue_title }}
+
+          ### Issue Description:
+
+          $(cat /tmp/issue_body.md)
+
+          ### PR Diff:
+
+          Read the full diff with: gh pr diff ${{ inputs.pr_number }}
+
+          TASK_EOF
+
+      - name: Run Claude Code
+        id: claude
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+          CLAUDECODE: ""
+        run: |
+          SESSION_ID=$(python3 -c "import uuid; print(uuid.uuid5(uuid.NAMESPACE_URL, '${{ github.repository }}/issues/${{ inputs.issue_number }}/review'))")
+
+          # Try to resume existing session; fall back to new session if not found
+          claude -p "$(cat /tmp/reviewer_prompt.md)" \
+            --agent reviewer \
+            --resume "$SESSION_ID" \
+            --dangerously-skip-permissions \
+            --output-format json \
+            --max-turns 30 \
+            > /tmp/claude_output.json 2>/tmp/claude_stderr.log || {
+              EXIT_CODE=$?
+              if grep -qi "no conversation found" /tmp/claude_stderr.log 2>/dev/null; then
+                echo "::notice::No existing session, starting fresh"
+                claude -p "$(cat /tmp/reviewer_prompt.md)" \
+                  --agent reviewer \
+                  --dangerously-skip-permissions \
+                  --output-format json \
+                  --max-turns 30 \
+                  > /tmp/claude_output.json 2>/tmp/claude_stderr.log || {
+                    EXIT_CODE=$?
+                    echo "claude_failed=true" >> "$GITHUB_OUTPUT"
+                    echo "::error::Claude Code (reviewer) exited with code $EXIT_CODE"
+                    cat /tmp/claude_stderr.log
+                    exit 0
+                  }
+              else
+                echo "claude_failed=true" >> "$GITHUB_OUTPUT"
+                echo "::error::Claude Code (reviewer) exited with code $EXIT_CODE"
+                cat /tmp/claude_stderr.log
+                exit 0
+              fi
+            }
+          echo "claude_failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Handle Claude failure
+        if: steps.claude.outputs.claude_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ inputs.issue_number }}" \
+            --body "Reviewer Agent failed on cycle ${{ inputs.review_cycle }}. [See workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          exit 1
+
+      - name: Check review decision
+        if: steps.claude.outputs.claude_failed != 'true'
+        id: decision
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # Check the latest review on the PR
+          REVIEW_STATE=$(gh pr view "${{ inputs.pr_number }}" \
+            --json reviews --jq '.reviews | sort_by(.submittedAt) | last | .state')
+
+          echo "review_state=$REVIEW_STATE" >> "$GITHUB_OUTPUT"
+          echo "::notice::Review decision: $REVIEW_STATE"
+
+      - name: Handle approval
+        if: steps.decision.outputs.review_state == 'APPROVED'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.config.outputs.yolo_mode }}" = "true" ]; then
+            echo "::notice::YOLO mode — auto-merging PR #${{ inputs.pr_number }}"
+
+            gh pr merge "${{ inputs.pr_number }}" --squash --delete-branch
+
+            gh issue comment "${{ inputs.issue_number }}" \
+              --repo "${{ github.repository }}" \
+              --body "**Reviewer Agent** (cycle ${{ inputs.review_cycle }}): PR #${{ inputs.pr_number }} approved and auto-merged (YOLO mode)."
+
+            # Update project status to Done
+            if [ -n "${{ inputs.project_node_id }}" ]; then
+              FIELD_DATA=$(gh api graphql -f query='
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      fields(first: 20) {
+                        nodes {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options { id name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }' -f projectId="${{ inputs.project_node_id }}" \
+                --jq '.data.node.fields.nodes[] | select(.name == "Status")')
+
+              FIELD_ID="$(echo "$FIELD_DATA" | jq -r '.id')"
+              OPTION_ID="$(echo "$FIELD_DATA" | jq -r '.options[] | select(.name == "Done") | .id')"
+
+              gh api graphql -f query='
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }' \
+                -f projectId="${{ inputs.project_node_id }}" \
+                -f itemId="${{ inputs.item_node_id }}" \
+                -f fieldId="$FIELD_ID" \
+                -f optionId="$OPTION_ID"
+            fi
+          else
+            echo "::notice::PR #${{ inputs.pr_number }} approved! Status stays on 'In review' for human review."
+
+            gh issue comment "${{ inputs.issue_number }}" \
+              --repo "${{ github.repository }}" \
+              --body "**Reviewer Agent** (cycle ${{ inputs.review_cycle }}): PR #${{ inputs.pr_number }} approved. Please review and merge the PR, then move the issue to Done."
+          fi
+
+      - name: Handle changes requested
+        if: steps.decision.outputs.review_state == 'CHANGES_REQUESTED'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+        run: |
+          NEXT_CYCLE=$(( ${{ inputs.review_cycle }} + 1 ))
+          MAX_CYCLES="${{ steps.config.outputs.max_review_cycles }}"
+
+          if [ "$NEXT_CYCLE" -ge "$MAX_CYCLES" ]; then
+            echo "::warning::Max review cycles ($MAX_CYCLES) reached. Escalating to human."
+
+            gh label create "needs-human-review" --color "FBCA04" \
+              --description "Agent review cycles exhausted" 2>/dev/null || true
+            gh issue edit "${{ inputs.issue_number }}" --add-label "needs-human-review"
+            gh issue comment "${{ inputs.issue_number }}" \
+              --body "**Reviewer Agent**: Max review cycles ($MAX_CYCLES) reached. Please review PR #${{ inputs.pr_number }} manually."
+          else
+            echo "::notice::Changes requested. Starting cycle $NEXT_CYCLE."
+
+            # Update review-cycle label
+            gh label create "review-cycle:${NEXT_CYCLE}" --color "0E8A16" \
+              --description "Review cycle counter" 2>/dev/null || true
+            gh issue edit "${{ inputs.issue_number }}" \
+              --remove-label "review-cycle:${{ inputs.review_cycle }}" 2>/dev/null || true
+            gh issue edit "${{ inputs.issue_number }}" \
+              --add-label "review-cycle:${NEXT_CYCLE}"
+
+            # Update project status back to Ready
+            if [ -n "${{ inputs.project_node_id }}" ]; then
+              FIELD_DATA=$(gh api graphql -f query='
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      fields(first: 20) {
+                        nodes {
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options { id name }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }' -f projectId="${{ inputs.project_node_id }}" \
+                --jq '.data.node.fields.nodes[] | select(.name == "Status")')
+
+              FIELD_ID="$(echo "$FIELD_DATA" | jq -r '.id')"
+              OPTION_ID="$(echo "$FIELD_DATA" | jq -r '.options[] | select(.name == "Ready") | .id')"
+
+              gh api graphql -f query='
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }' \
+                -f projectId="${{ inputs.project_node_id }}" \
+                -f itemId="${{ inputs.item_node_id }}" \
+                -f fieldId="$FIELD_ID" \
+                -f optionId="$OPTION_ID"
+            fi
+
+            # Status is now "Ready" — the board event will trigger the orchestrator,
+            # which will dispatch the developer for the next cycle.
+          fi
