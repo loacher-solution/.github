@@ -1,0 +1,9 @@
+{
+    "name": "Agentic Reviewer",
+    "description": "Dispatches Claude Code as an autonomous reviewer agent to review a Pull Request.",
+    "iconName": "octicon-eye",
+    "categories": [
+        "Automation",
+        "AI"
+    ]
+}
