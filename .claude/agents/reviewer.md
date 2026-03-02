@@ -72,3 +72,4 @@ Recent logs are automatically injected at session start via a SessionStart hook.
 Use them to understand what has happened in this repo recently.
 
 IMPORTANT: You MUST post exactly one review using gh pr review. Either --approve or --request-changes.
+After running gh pr review, your work is done. Do NOT run gh pr review again. Do NOT verify by running it a second time. One call = done.
