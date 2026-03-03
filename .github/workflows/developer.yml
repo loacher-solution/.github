@@ -108,6 +108,16 @@ jobs:
             echo "claude already installed: $(claude --version 2>/dev/null || echo 'ok')"
           fi
 
+      - name: Run repo-specific prerequisites
+        run: |
+          if [ -f ".claude/prerequisites.sh" ]; then
+            echo "::group::Running repo-specific prerequisites"
+            bash .claude/prerequisites.sh
+            echo "::endgroup::"
+          else
+            echo "No repo-specific prerequisites found (.claude/prerequisites.sh)"
+          fi
+
       - name: Read repo config
         id: config
         run: |
