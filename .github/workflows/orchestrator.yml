@@ -25,7 +25,7 @@ on:
         description: "PAT with actions:write for cross-repo dispatch"
         required: true
 
-  # Manual trigger for testing without the project board
+  # Manual trigger for testing / cron-based queue processing
   workflow_dispatch:
     inputs:
       issue_repo:
@@ -36,6 +36,21 @@ on:
         description: "Issue number to process"
         type: string
         required: true
+      project_node_id:
+        description: "Project node ID (optional, enables project status updates)"
+        type: string
+        required: false
+        default: ""
+      item_node_id:
+        description: "Project item node ID (optional)"
+        type: string
+        required: false
+        default: ""
+      content_node_id:
+        description: "Content node ID / issue node ID (optional)"
+        type: string
+        required: false
+        default: ""
 
 jobs:
   orchestrate:
@@ -76,7 +91,12 @@ jobs:
         id: trigger
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "source=manual" >> "$GITHUB_OUTPUT"
+            # Manual / cron dispatch — may include project context
+            if [ -n "${{ inputs.project_node_id }}" ] && [ -n "${{ inputs.item_node_id }}" ]; then
+              echo "source=manual_with_project" >> "$GITHUB_OUTPUT"
+            else
+              echo "source=manual" >> "$GITHUB_OUTPUT"
+            fi
             echo "issue_repo=${{ inputs.issue_repo }}" >> "$GITHUB_OUTPUT"
             echo "issue_number=${{ inputs.issue_number }}" >> "$GITHUB_OUTPUT"
           else
@@ -84,7 +104,7 @@ jobs:
           fi
 
       - name: Get issue details from project item
-        if: steps.trigger.outputs.source == 'project'
+        if: steps.trigger.outputs.source == 'project' || steps.trigger.outputs.source == 'manual_with_project'
         id: issue_from_project
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
@@ -181,8 +201,55 @@ jobs:
               --add-label "review-cycle:0"
           fi
 
+      - name: Get current review cycle
+        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true'
+        id: review_cycle
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract current review cycle from labels (default 0)
+          CYCLE=$(gh issue view "${{ steps.issue.outputs.number }}" \
+            --repo "${{ steps.issue.outputs.repo }}" \
+            --json labels --jq '.labels[].name' | grep "^review-cycle:" | sed 's/review-cycle://' || echo "0")
+          if [ -z "$CYCLE" ]; then
+            CYCLE="0"
+          fi
+          echo "cycle=$CYCLE" >> "$GITHUB_OUTPUT"
+
+      - name: Read target repo config
+        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true'
+        id: repo_config
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          CONFIG=$(gh api "repos/${{ steps.issue.outputs.repo }}/contents/.claude/config.yml" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+          DEDICATED_BRANCH=""
+          if [ -n "$CONFIG" ]; then
+            DEDICATED_BRANCH=$(echo "$CONFIG" | grep '^dedicated_branch:' | sed 's/dedicated_branch://' | tr -d ' "'"'" | head -1)
+          fi
+          echo "dedicated_branch=${DEDICATED_BRANCH:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for active developer runs (dedicated branch)
+        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && steps.repo_config.outputs.dedicated_branch != ''
+        id: check_active
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ACTIVE=$(gh run list \
+            --repo "${{ steps.issue.outputs.repo }}" \
+            --workflow "agentic-developer.yml" \
+            --json status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+          if [ "$ACTIVE" -gt 0 ]; then
+            echo "::notice::Skipping dispatch — $ACTIVE active developer run(s) for ${{ steps.issue.outputs.repo }} (dedicated branch mode). Cron will retry."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Update project status to In Progress
-        if: steps.trigger.outputs.source == 'project' && steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && steps.issue_from_project.outputs.status == 'Ready'
+        if: (steps.trigger.outputs.source == 'project' || steps.trigger.outputs.source == 'manual_with_project') && steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && steps.check_active.outputs.skip != 'true' && steps.issue_from_project.outputs.status == 'Ready'
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
         run: |
@@ -225,37 +292,8 @@ jobs:
             -f fieldId="$FIELD_ID" \
             -f optionId="$OPTION_ID"
 
-      - name: Get current review cycle
-        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true'
-        id: review_cycle
-        env:
-          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          # Extract current review cycle from labels (default 0)
-          CYCLE=$(gh issue view "${{ steps.issue.outputs.number }}" \
-            --repo "${{ steps.issue.outputs.repo }}" \
-            --json labels --jq '.labels[].name' | grep "^review-cycle:" | sed 's/review-cycle://' || echo "0")
-          if [ -z "$CYCLE" ]; then
-            CYCLE="0"
-          fi
-          echo "cycle=$CYCLE" >> "$GITHUB_OUTPUT"
-
-      - name: Read target repo config
-        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true'
-        id: repo_config
-        env:
-          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          CONFIG=$(gh api "repos/${{ steps.issue.outputs.repo }}/contents/.claude/config.yml" \
-            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-          DEDICATED_BRANCH=""
-          if [ -n "$CONFIG" ]; then
-            DEDICATED_BRANCH=$(echo "$CONFIG" | grep '^dedicated_branch:' | sed 's/dedicated_branch://' | tr -d ' "'"'" | head -1)
-          fi
-          echo "dedicated_branch=${DEDICATED_BRANCH:-}" >> "$GITHUB_OUTPUT"
-
       - name: Dispatch developer workflow
-        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && (steps.issue_from_project.outputs.status == 'Ready' || steps.trigger.outputs.source == 'manual')
+        if: steps.issue_from_project.outputs.skip != 'true' && steps.check_failed.outputs.skip != 'true' && steps.check_active.outputs.skip != 'true' && (steps.issue_from_project.outputs.status == 'Ready' || steps.trigger.outputs.source == 'manual' || steps.trigger.outputs.source == 'manual_with_project')
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
         run: |

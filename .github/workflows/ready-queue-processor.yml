@@ -1,0 +1,147 @@
+name: Ready Queue Processor
+
+# Picks up "Ready" project items that the event-driven orchestrator could not
+# dispatch (e.g. because a dedicated-branch repo already had an active run).
+# Runs every 5 minutes as a safety net.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Only one processor at a time; if runners are busy the next cron waits.
+concurrency:
+  group: ready-queue-processor
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: self-hosted
+    steps:
+      - name: Setup prerequisites
+        run: |
+          NEED_APT=false
+          PACKAGES=""
+          if ! command -v jq &>/dev/null; then
+            NEED_APT=true
+            PACKAGES="jq"
+          fi
+          if [ "$NEED_APT" = "true" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y $PACKAGES
+          fi
+          if ! command -v gh &>/dev/null; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update -qq && sudo apt-get install -y gh
+          fi
+
+      - name: Find Ready items across all projects
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+        run: |
+          ORG="${{ github.repository_owner }}"
+
+          # Fetch all org projects and their items in one query
+          ITEMS_JSON=$(gh api graphql -f query='
+            query($org: String!) {
+              organization(login: $org) {
+                projectsV2(first: 20) {
+                  nodes {
+                    id
+                    items(first: 100) {
+                      nodes {
+                        id
+                        fieldValueByName(name: "Status") {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                          }
+                        }
+                        content {
+                          ... on Issue {
+                            id
+                            number
+                            repository {
+                              nameWithOwner
+                            }
+                            labels(first: 20) {
+                              nodes {
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f org="$ORG")
+
+          # Extract Ready items that are issues without agent-failed label
+          echo "$ITEMS_JSON" | jq -c '
+            [.data.organization.projectsV2.nodes[] |
+              .id as $projectId |
+              .items.nodes[] |
+              select(
+                .fieldValueByName.name == "Ready" and
+                .content.number != null and
+                ([.content.labels.nodes[].name] | any(. == "agent-failed") | not)
+              ) |
+              {
+                project_node_id: $projectId,
+                item_node_id: .id,
+                content_node_id: .content.id,
+                issue_number: (.content.number | tostring),
+                issue_repo: .content.repository.nameWithOwner
+              }
+            ]' > /tmp/ready_items.json
+
+          COUNT=$(jq 'length' /tmp/ready_items.json)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "::notice::Found $COUNT Ready item(s) to process"
+
+      - name: Dispatch orchestrator for each Ready item
+        if: steps.scan.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+        run: |
+          jq -c '.[]' /tmp/ready_items.json | while read -r ITEM; do
+            REPO=$(echo "$ITEM" | jq -r '.issue_repo')
+            ISSUE=$(echo "$ITEM" | jq -r '.issue_number')
+            PROJECT_ID=$(echo "$ITEM" | jq -r '.project_node_id')
+            ITEM_ID=$(echo "$ITEM" | jq -r '.item_node_id')
+            CONTENT_ID=$(echo "$ITEM" | jq -r '.content_node_id')
+
+            echo "::group::Processing $REPO#$ISSUE"
+
+            # Check for active developer runs in the target repo
+            ACTIVE=$(gh run list \
+              --repo "$REPO" \
+              --workflow "agentic-developer.yml" \
+              --json status \
+              --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' 2>/dev/null || echo "0")
+
+            if [ "$ACTIVE" -gt 0 ]; then
+              echo "::notice::Skipping $REPO#$ISSUE — $ACTIVE active developer run(s)"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Dispatch the orchestrator with full project context
+            echo "Dispatching orchestrator for $REPO#$ISSUE"
+            gh workflow run orchestrator.yml \
+              --repo "${{ github.repository }}" \
+              -f issue_repo="$REPO" \
+              -f issue_number="$ISSUE" \
+              -f project_node_id="$PROJECT_ID" \
+              -f item_node_id="$ITEM_ID" \
+              -f content_node_id="$CONTENT_ID" || {
+                echo "::warning::Failed to dispatch orchestrator for $REPO#$ISSUE"
+              }
+
+            echo "::endgroup::"
+          done
