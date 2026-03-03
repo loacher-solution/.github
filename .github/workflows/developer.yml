@@ -290,6 +290,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
 
+      - name: Handle no changes from Claude
+        if: steps.claude.outputs.claude_failed != 'true' && steps.push.outputs.has_changes == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "needs-human-review" --color "D93F0B" \
+            --description "Agent could not complete — needs human attention" 2>/dev/null || true
+          gh issue edit "${{ inputs.issue_number }}" --add-label "needs-human-review"
+          gh issue comment "${{ inputs.issue_number }}" \
+            --body "**Developer Agent** ran successfully but produced no changes (cycle ${{ inputs.review_cycle }}).
+          The agent was unable to implement this issue autonomously.
+
+          [View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          This issue needs human attention."
+
       - name: Create or update PR
         if: steps.claude.outputs.claude_failed != 'true' && steps.push.outputs.has_changes != 'false'
         id: pr
