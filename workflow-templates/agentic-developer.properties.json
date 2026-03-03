@@ -1,0 +1,9 @@
+{
+    "name": "Agentic Developer",
+    "description": "Dispatches Claude Code as an autonomous developer agent to implement a GitHub Issue.",
+    "iconName": "octicon-cpu",
+    "categories": [
+        "Automation",
+        "AI"
+    ]
+}
