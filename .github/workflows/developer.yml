@@ -260,6 +260,31 @@ jobs:
             }
           echo "claude_failed=false" >> "$GITHUB_OUTPUT"
 
+      - name: Log Claude output summary
+        if: always()
+        run: |
+          echo "::group::Claude stderr"
+          cat /tmp/claude_stderr.log 2>/dev/null || echo "(empty)"
+          echo "::endgroup::"
+
+          echo "::group::Claude output summary"
+          if [ -f /tmp/claude_output.json ]; then
+            # Show result text (truncated to avoid flooding logs)
+            jq -r '.result // .error // "No result field"' /tmp/claude_output.json 2>/dev/null | head -100
+            echo "---"
+            echo "Total cost: $(jq -r '.cost_usd // "unknown"' /tmp/claude_output.json 2>/dev/null)"
+            echo "Turns used: $(jq -r '.num_turns // "unknown"' /tmp/claude_output.json 2>/dev/null)"
+            echo "Duration:   $(jq -r '.duration_ms // "unknown"' /tmp/claude_output.json 2>/dev/null)ms"
+          else
+            echo "(no output file)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Git status after Claude"
+          git status --short
+          git log --oneline -5
+          echo "::endgroup::"
+
       - name: Handle Claude failure
         if: steps.claude.outputs.claude_failed == 'true'
         env:
